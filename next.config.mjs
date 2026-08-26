@@ -1,6 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: 'standalone',
+  // 'standalone' is for self-hosting (Docker/bare-metal). On Vercel it conflicts
+  // with the platform's own file tracing (missing .nft.json), so skip it there.
+  output: process.env.VERCEL ? undefined : 'standalone',
   typescript: {
     ignoreBuildErrors: true,
   },

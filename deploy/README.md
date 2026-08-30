@@ -279,9 +279,39 @@ curl -fsS https://$DOMAIN/api/internal/webhook-worker/health   # expect 200 / wo
 
 ---
 
+## Part 9 — Observability: log search & tracing (EE, optional)
+
+One new container, `otel-collector`, gated behind the `observability` compose
+profile so it only runs when you ask for it. Its secrets live in their own
+file, not `app.env` — it's a third-party image with a read-only mount over
+every container's log history, so it only gets the two vars it actually
+needs rather than `JWT_SECRET`/`DATABASE_URL`/the rest of `app.env`:
+
+    sudo -u deploy install -m 0600 /dev/stdin /srv/inboxui/secrets/otel-collector.env <<'EOF'
+    OTEL_EXPORTER_ENDPOINT=https://otlp-gateway-prod-us-east-0.grafana.net/otlp
+    OTEL_EXPORTER_AUTH=Basic <base64 of instanceID:apiToken>
+    OTEL_SERVICE_NAME=inboxui
+    EOF
+
+Then add the app's half — `ENABLE_OBSERVABILITY` and the `OTEL_EXPORTER_OTLP_*` vars (pointed at
+the collector on the internal network, not at your OTLP backend directly) — from the
+"Observability" section of `.env.example` to `/srv/inboxui/secrets/app.env` from Part 3. Then:
+
+    sudo -u deploy docker compose -f docker-compose.yml --profile observability up -d
+
+Restarting just `app` (`docker compose restart app`) is not enough by itself —
+the collector has to actually be running for either signal to leave the box.
+
+Full setup (getting the endpoint/headers from Grafana Cloud's free tier) is in
+docs/observability-operator-guide.md.
+
+---
+
 ## Day-to-day deploys
 
-Pushing to `main` runs CI (lint + test + build) and, on green, SSHes to the box and runs the deploy steps inlined in `.github/workflows/deploy.yml`: it syncs the compose file, pulls `app`+`migrate`, runs `migrate`, rolls `app` + `caddy` behind a healthcheck gate (`--no-deps`, so postgres/redis are untouched), and prunes old images. No manual step.
+Pushing to `main` runs CI (lint + test + build) and, on green, SSHes to the box and runs the deploy steps inlined in `.github/workflows/deploy.yml`: it syncs the compose file and `otel-collector.yaml`, pulls `app`+`migrate`, runs `migrate`, rolls `app` + `caddy` behind a healthcheck gate (`--no-deps`, so postgres/redis — and `otel-collector`, if it's running — are untouched), and prunes old images. No manual step.
+
+If `otel-collector.yaml` itself changed and the `observability` profile is already active, the synced file alone isn't enough — like postgres/redis, `otel-collector` is deliberately outside the `--no-deps app caddy` roll, so it keeps running the config it started with until a human recreates it. A plain `up -d` won't do that either: Compose's recreate-detection hashes `docker-compose.yml`'s resolved service definition, not the contents of a bind-mounted file, so it sees nothing changed and leaves the stale container running. `--force-recreate` is required (Part 9).
 
 **Rollback** to a known-good image (uses the manual `initial_deploy.sh`, kept in sync on the box by CI):
 

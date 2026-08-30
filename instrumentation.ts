@@ -27,6 +27,18 @@ export async function register() {
     const { assertConfig } = await import('@/lib/config/assert')
     assertConfig()
 
+    // Observability (traces, EE). Log shipping is not initialized here — it
+    // happens outside the process, via the collector tailing this
+    // container's Docker stdout. See ee/observability/init.ts.
+    const { initializeObservability } = await import('@/ee/observability/init')
+    initializeObservability()
+
+    // Product analytics (EE, issue #152): PostHog session replay,
+    // autocapture and named feature/conversion events. A no-op unless
+    // ENABLE_PRODUCT_ANALYTICS is true. See ee/product-analytics/init.ts.
+    const { initializeProductAnalytics } = await import('@/ee/product-analytics/init')
+    initializeProductAnalytics()
+
     // Plan enforcement (issue #117). Runs once per process, here rather than in
     // `app/layout.tsx` where it previously sat — that is a React Server
     // Component render function, so it re-ran on every RSC render and was

@@ -60,6 +60,8 @@ export interface EmailMessage {
   references: string[]
   tags: string[]
   isStarred: boolean
+  /** Inbox-wide, not per-user — one shared flag, like isStarred (issue #138). */
+  isRead: boolean
   categories: string[]
   extractedOtp: string | null
   metadata: {
@@ -184,16 +186,12 @@ export async function starEmailMessage(
   })
 }
 
-export interface OtpResult {
-  otp: string
-  receivedAt: string
-  messageId: string
-}
-
-/**
- * Get the most recently received OTP for an inbox
- * GET /app/emailInbox/{id}/otp
- */
-export async function getLatestOtp(inboxId: string): Promise<OtpResult> {
-  return apiClient.get<OtpResult>(`/app/emailInbox/${inboxId}/otp`)
+export async function setEmailMessageRead(
+  inboxId: string,
+  messageId: string,
+  isRead: boolean
+): Promise<EmailMessage> {
+  return apiClient.patch<EmailMessage>(`/app/emailInbox/${inboxId}/messages/${messageId}`, {
+    isRead,
+  })
 }

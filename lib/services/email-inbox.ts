@@ -11,7 +11,7 @@ import { validateInboxAddress, validateInboxName } from '@/lib/validation/inbox-
 import { INVALID_ADDRESS } from '@/lib/validation/inbox-policy-messages'
 import { isUniqueViolation } from '@/lib/api-helpers'
 import { checkResourceLimit } from '@/lib/commercial/enforce'
-import type { OrgScope, OwnerScope, InboxWriteScope, InboxDeleteScope } from './scope'
+import type { OrgScope, OwnerScope, InboxWriteScope, InboxDeleteScope, MessageReadScope } from './scope'
 
 type EmailInboxRow = Awaited<ReturnType<typeof prisma.emailInbox.create>>
 
@@ -132,6 +132,56 @@ function page(rows: ListMessagesResult['messages'], limit: number): ListMessages
     hasMore,
     nextCursor: hasMore ? encodeCursor(messages[messages.length - 1]) : null,
   }
+}
+
+/** How many recent messages `findLatestOtp` scans for one carrying a code. */
+export const OTP_SCAN_LIMIT = 25
+
+/** Default freshness window for an OTP, in minutes. */
+export const OTP_DEFAULT_WINDOW_MINUTES = 15
+
+export type LatestOtpResult =
+  | { found: true; message: MessageListRow }
+  // Distinguishes "a code arrived but is older than the window" from
+  // "nothing arrived at all" — the fix differs (raise the window vs. wait and
+  // retry), so collapsing the two loses information every caller needs.
+  | { found: false; stale: boolean }
+
+/**
+ * The shared core of "read the code back for this inbox" — used by both the
+ * v1 REST route and the MCP tool (pibx_email_get_latest_otp), so the scan
+ * depth, freshness window and staleness distinction live in one place rather
+ * than two copies that can drift. Callers serialize `message` per surface.
+ *
+ * Returns null when the inbox itself is not visible to `scope`, exactly like
+ * `listMessages` — a caller distinguishes that from "no OTP yet" by checking
+ * for null before `found`.
+ */
+export async function findLatestOtp(
+  scope: OrgScope,
+  inboxId: string,
+  opts: { search?: MessageSearch | null; windowMinutes?: number } = {},
+): Promise<LatestOtpResult | null> {
+  const result = await listMessages(scope, inboxId, {
+    limit: OTP_SCAN_LIMIT,
+    cursor: null,
+    threadId: null,
+    grouped: false,
+    search: opts.search ?? null,
+  })
+  if (!result) return null
+
+  const windowMinutes = opts.windowMinutes ?? OTP_DEFAULT_WINDOW_MINUTES
+  const cutoff = Date.now() - windowMinutes * 60_000
+  const rows = result.messages as Array<MessageListRow & { extractedOtp: string | null }>
+  const match = rows.find((row) => row.extractedOtp !== null && row.createdAt.getTime() >= cutoff)
+
+  if (!match) {
+    const stale = rows.some((row) => row.extractedOtp !== null)
+    return { found: false, stale }
+  }
+
+  return { found: true, message: match }
 }
 
 export async function getMessage(scope: OrgScope, inboxId: string, messageId: string) {
@@ -421,6 +471,29 @@ export async function setMessageStarred(
   if (!message) return null
 
   return prisma.emailMessage.update({ where: { id: messageId }, data: { isStarred } })
+}
+
+/**
+ * Org-scoped, not owner-scoped (issue #138) — see `MessageReadScope`. Any
+ * member of the inbox's organization may flip `isRead`, not just its creator,
+ * since auto-marking on open has to work for every teammate viewing a shared
+ * inbox.
+ */
+export async function setMessageRead(
+  scope: MessageReadScope,
+  inboxId: string,
+  messageId: string,
+  isRead: boolean,
+) {
+  const inbox = await getInbox(scope, inboxId)
+  if (!inbox) return null
+
+  const message = await prisma.emailMessage.findFirst({
+    where: { id: messageId, inboxEmailAddressId: inboxId },
+  })
+  if (!message) return null
+
+  return prisma.emailMessage.update({ where: { id: messageId }, data: { isRead } })
 }
 
 export async function deleteMessage(

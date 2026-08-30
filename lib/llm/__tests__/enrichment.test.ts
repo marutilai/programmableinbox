@@ -34,6 +34,19 @@ vi.mock('@/lib/db', () => ({
   },
 }))
 
+const startActiveSpanMock = vi.fn((_name: string, fn: (span: unknown) => unknown) => {
+  const fakeSpan = { setAttribute: vi.fn(), setStatus: vi.fn(), recordException: vi.fn(), end: vi.fn() }
+  return fn(fakeSpan)
+})
+
+vi.mock('@opentelemetry/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@opentelemetry/api')>()
+  return {
+    ...actual,
+    trace: { ...actual.trace, getTracer: () => ({ startActiveSpan: startActiveSpanMock }) },
+  }
+})
+
 const ENRICHMENT_RESULT: EnrichmentResult = {
   categories: ['Security'],
   extractedOtp: '654321',
@@ -56,6 +69,26 @@ describe('enrichMessage', () => {
     mockEnrich.mockResolvedValue(ENRICHMENT_RESULT)
   })
 
+  it('wraps enrichment in an OTel span named llm.enrich_message', async () => {
+    const { enrichMessage } = await import('../enrichment')
+    await enrichMessage('msg-1')
+
+    expect(startActiveSpanMock).toHaveBeenCalledWith('llm.enrich_message', expect.any(Function))
+  })
+
+  it('never throws, even when an unexpected error occurs outside enrichMessageInner\'s own catch-all', async () => {
+    // getProvider() runs before enrichMessageInner's try block, so a throw
+    // here reaches the span wrapper's catch — the one path that exercises
+    // it. enrichMessage's documented contract is to never throw; the span
+    // wrapper must preserve that rather than rethrowing.
+    mockGetProvider.mockImplementation(() => {
+      throw new Error('provider factory misconfigured')
+    })
+    const { enrichMessage } = await import('../enrichment')
+
+    await expect(enrichMessage('msg-1')).resolves.toBe(false)
+  })
+
   it('writes categories, extractedOtp, and metadata on success', async () => {
     const { enrichMessage } = await import('../enrichment')
     await enrichMessage('msg-1')
@@ -68,6 +101,30 @@ describe('enrichMessage', () => {
         metadata: { links: [], timestamps: [] },
       },
     })
+  })
+
+  /**
+   * `text` is empty for HTML-only mail (webhook route sets `text: resendEmail.text || ''`);
+   * `bodyText` is derived at ingestion and falls back to HTML-extracted text in that case.
+   * Enrichment must read from `bodyText` or an OTP embedded only in the HTML part is invisible
+   * to the LLM.
+   */
+  it('enriches from bodyText, not the raw text field, when text is empty (HTML-only mail)', async () => {
+    mockFindUnique.mockResolvedValue({
+      id: 'msg-1',
+      subject: 'Your ChatGPT code',
+      text: '',
+      bodyText: 'Enter this temporary verification code to continue: 851079',
+      metadata: null,
+      organizationId: 'org-1',
+    })
+    const { enrichMessage } = await import('../enrichment')
+    await enrichMessage('msg-1')
+
+    expect(mockEnrich).toHaveBeenCalledWith(
+      'Your ChatGPT code',
+      'Enter this temporary verification code to continue: 851079',
+    )
   })
 
   it('skips when LLM_PROVIDER is not configured (getProvider returns null)', async () => {

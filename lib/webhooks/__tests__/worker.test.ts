@@ -54,6 +54,23 @@ const MockRedis = vi.fn().mockImplementation(function () {
 vi.mock('ioredis', () => ({ Redis: MockRedis, default: MockRedis }));
 
 // ---------------------------------------------------------------------------
+// @opentelemetry/api mock — captures the span the worker starts
+// ---------------------------------------------------------------------------
+
+const startActiveSpanMock = vi.fn((_name: string, fn: (span: unknown) => unknown) => {
+  const fakeSpan = { setAttribute: vi.fn(), setStatus: vi.fn(), recordException: vi.fn(), end: vi.fn() };
+  return fn(fakeSpan);
+});
+
+vi.mock('@opentelemetry/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@opentelemetry/api')>();
+  return {
+    ...actual,
+    trace: { ...actual.trace, getTracer: () => ({ startActiveSpan: startActiveSpanMock }) },
+  };
+});
+
+// ---------------------------------------------------------------------------
 // Prisma mock
 // ---------------------------------------------------------------------------
 
@@ -75,6 +92,17 @@ vi.mock('@/lib/db', () => ({
 const mockStoreIncomingEmail = vi.fn();
 const mockDispatchAutomationsForEmail = vi.fn().mockResolvedValue([]);
 const mockEnrichMessage = vi.fn().mockResolvedValue(undefined);
+
+// ---------------------------------------------------------------------------
+// Logger mock — worker.ts logs via @/lib/logger, not console
+// ---------------------------------------------------------------------------
+
+const mockLoggerInfo = vi.fn();
+const mockLoggerError = vi.fn();
+
+vi.mock('@/lib/logger', () => ({
+  default: { info: mockLoggerInfo, error: mockLoggerError, warn: vi.fn() },
+}));
 
 vi.mock('@/app/api/webhooks/email/route', () => ({
   storeIncomingEmail: (...args: unknown[]) => mockStoreIncomingEmail(...args),
@@ -100,6 +128,13 @@ async function freshImport() {
   // Re-apply mocks for the fresh module graph after resetModules.
   vi.mock('bullmq', () => ({ Worker: MockWorker }));
   vi.mock('ioredis', () => ({ Redis: MockRedis, default: MockRedis }));
+  vi.mock('@opentelemetry/api', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@opentelemetry/api')>();
+    return {
+      ...actual,
+      trace: { ...actual.trace, getTracer: () => ({ startActiveSpan: startActiveSpanMock }) },
+    };
+  });
   vi.mock('@/lib/db', () => ({
     prisma: {
       emailMessage: { findUnique: mockFindUnique, update: mockUpdate },
@@ -116,6 +151,9 @@ async function freshImport() {
   }));
   vi.mock('@/lib/llm/enrichment', () => ({
     enrichMessage: (...args: unknown[]) => mockEnrichMessage(...args),
+  }));
+  vi.mock('@/lib/logger', () => ({
+    default: { info: mockLoggerInfo, error: mockLoggerError, warn: vi.fn() },
   }));
 
   capturedProcessor = null;
@@ -296,7 +334,6 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
     });
 
     it('logs successful processing', async () => {
-      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       mockFindUnique.mockResolvedValueOnce(null);
       mockStoreIncomingEmail.mockResolvedValueOnce([{ id: 'msg_1' }]);
 
@@ -305,7 +342,7 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
 
       await capturedProcessor!(makeJob());
 
-      const messages = consoleSpy.mock.calls.map((c) => c[0]);
+      const messages = mockLoggerInfo.mock.calls.map((c) => c[1]);
       expect(messages.some((m) => m.includes('fully processed'))).toBe(true);
     });
 
@@ -329,6 +366,27 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
       getEmailWebhookWorker();
 
       await expect(capturedProcessor!(makeJob())).resolves.toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Job Processing — tracing
+  // -------------------------------------------------------------------------
+
+  describe('Job Processing — tracing', () => {
+    it('wraps job processing in an OTel span named webhook.process_email_job', async () => {
+      mockFindUnique.mockResolvedValueOnce(null);
+      mockStoreIncomingEmail.mockResolvedValueOnce([{ id: 'msg_1' }]);
+
+      const { getEmailWebhookWorker } = await freshImport();
+      getEmailWebhookWorker();
+
+      await capturedProcessor!(makeJob());
+
+      expect(startActiveSpanMock).toHaveBeenCalledWith(
+        'webhook.process_email_job',
+        expect.any(Function),
+      );
     });
   });
 
@@ -476,7 +534,6 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
     });
 
     it('logs that 0 messages were returned', async () => {
-      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       mockFindUnique.mockResolvedValueOnce(null);
       mockStoreIncomingEmail.mockResolvedValueOnce([]);
 
@@ -485,7 +542,7 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
 
       await capturedProcessor!(makeJob());
 
-      const messages = consoleSpy.mock.calls.map((c) => c[0]);
+      const messages = mockLoggerInfo.mock.calls.map((c) => c[1]);
       expect(
         messages.some((m) => typeof m === 'string' && m.includes('0 messages')),
       ).toBe(true);
@@ -525,7 +582,6 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
     });
 
     it('logs the error message on failure', async () => {
-      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       mockFindUnique.mockResolvedValueOnce(null);
       mockStoreIncomingEmail.mockRejectedValueOnce(new Error('Store failed'));
 
@@ -534,9 +590,9 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
 
       await capturedProcessor!(makeJob({ attemptsMade: 0 })).catch(() => {});
 
-      expect(errorSpy).toHaveBeenCalledWith(
+      expect(mockLoggerError).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.objectContaining({ message: 'Store failed' }) }),
         expect.stringContaining('error'),
-        'Store failed',
       );
     });
 
@@ -716,7 +772,6 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
     });
 
     it('logs dead-letter write', async () => {
-      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       mockFindUnique.mockResolvedValueOnce(null);
       mockStoreIncomingEmail.mockRejectedValueOnce(new Error('fail'));
 
@@ -727,7 +782,7 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
         makeJob({ attemptsMade: 3, maxAttempts: 4 }),
       ).catch(() => {});
 
-      const messages = consoleSpy.mock.calls.map((c) => c[0]);
+      const messages = mockLoggerInfo.mock.calls.map((c) => c[1]);
       expect(messages.some((m) => m.includes('dead-letter'))).toBe(true);
     });
 
@@ -748,7 +803,6 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
     });
 
     it('logs the dead-letter write failure when upsert throws', async () => {
-      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       mockFindUnique.mockResolvedValueOnce(null);
       mockStoreIncomingEmail.mockRejectedValueOnce(new Error('fail'));
       mockDeadLetterUpsert.mockRejectedValueOnce(new Error('DL write failed'));
@@ -760,7 +814,7 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
         makeJob({ attemptsMade: 3, maxAttempts: 4 }),
       ).catch(() => {});
 
-      const calls = errorSpy.mock.calls.map((c) => c[0]);
+      const calls = mockLoggerError.mock.calls.map((c) => c[1]);
       expect(calls.some((m) => m.includes('dead-letter'))).toBe(true);
     });
   });
@@ -854,10 +908,9 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
     });
 
     it('logs that the worker started', async () => {
-      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const { startEmailWebhookWorker } = await freshImport();
       await startEmailWebhookWorker();
-      const messages = consoleSpy.mock.calls.map((c) => c[0]);
+      const messages = mockLoggerInfo.mock.calls.map((c) => c[0]);
       expect(messages.some((m) => m.includes('started'))).toBe(true);
     });
 
@@ -881,12 +934,11 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
     });
 
     it('logs that the worker closed', async () => {
-      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const { getEmailWebhookWorker, closeEmailWebhookWorker } =
         await freshImport();
       getEmailWebhookWorker();
       await closeEmailWebhookWorker();
-      const messages = consoleSpy.mock.calls.map((c) => c[0]);
+      const messages = mockLoggerInfo.mock.calls.map((c) => c[0]);
       expect(messages.some((m) => m.includes('closed'))).toBe(true);
     });
 
@@ -933,7 +985,6 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
 
   describe('"failed" event handler', () => {
     it('logs the job id and attempt count on failure', async () => {
-      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       const { getEmailWebhookWorker } = await freshImport();
       getEmailWebhookWorker(); // registers event handlers
 
@@ -944,14 +995,13 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
         opts: { attempts: 4 },
       } as unknown as Job<EmailWebhookJobData>, new Error('kaboom'));
 
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining('job_99'),
+      expect(mockLoggerError).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job_99', attempt: 2 }),
         expect.any(String),
       );
     });
 
     it('does not throw when job argument is undefined', async () => {
-      vi.spyOn(console, 'error').mockImplementation(() => {});
       const { getEmailWebhookWorker } = await freshImport();
       getEmailWebhookWorker();
 
@@ -967,7 +1017,6 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
 
   describe('"completed" event handler', () => {
     it('logs the job id and externalId on completion', async () => {
-      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const { getEmailWebhookWorker } = await freshImport();
       getEmailWebhookWorker();
 
@@ -978,8 +1027,10 @@ describe('Email Webhook Worker (lib/webhooks/worker.ts)', () => {
         opts: { attempts: 4 },
       } as unknown as Job<EmailWebhookJobData>);
 
-      const messages = consoleSpy.mock.calls.map((c) => c[0]);
-      expect(messages.some((m) => m.includes('job_42') && m.includes('em_77'))).toBe(true);
+      expect(mockLoggerInfo).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job_42', externalId: 'em_77' }),
+        expect.any(String),
+      );
     });
   });
 });

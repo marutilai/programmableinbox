@@ -5,9 +5,10 @@ import {
   PATCH as patchMessage,
   DELETE as deleteMessage,
 } from '@/app/api/app/emailInbox/[id]/messages/[messageId]/route'
-import { GET as getOtp } from '@/app/api/app/emailInbox/[id]/otp/route'
+import { GET as getOtp } from '@/app/api/v1/emailInbox/[id]/otp/route'
 import { prisma } from '@/lib/db'
-import { createOrgWithUser, createSecondOrg } from './helpers/auth'
+import { signToken, hashPassword } from '@/lib/auth-server'
+import { createOrgWithUser, createSecondOrg, createApiKey } from './helpers/auth'
 import { seedInbox, seedMessage } from './helpers/factories'
 import { jsonRequest, params } from './helpers/request'
 
@@ -291,6 +292,95 @@ describe('PATCH /api/app/emailInbox/[id]/messages/[messageId]', () => {
   })
 })
 
+describe('PATCH /api/app/emailInbox/[id]/messages/[messageId] — isRead (issue #138)', () => {
+  it('updates isRead and persists it', async () => {
+    const { org, user, token } = await createOrgWithUser()
+    const inbox = await seedInbox(org.id, user.id)
+    const message = await seedMessage(inbox.id, org.id, { isRead: false })
+
+    const res = await patchMessage(
+      jsonRequest(`http://localhost/api/app/emailInbox/${inbox.id}/messages/${message.id}`, {
+        method: 'PATCH', credential: token,
+        body: { isRead: true },
+      }),
+      params({ id: inbox.id, messageId: message.id }),
+    )
+    expect(res.status).toBe(200)
+    const { data } = await res.json()
+    expect(data.isRead).toBe(true)
+
+    const row = await prisma.emailMessage.findUniqueOrThrow({ where: { id: message.id } })
+    expect(row.isRead).toBe(true)
+  })
+
+  it('lets a colleague who did not create the inbox mark it read, unlike isStarred', async () => {
+    const { org, user } = await createOrgWithUser()
+    const inbox = await seedInbox(org.id, user.id)
+    const message = await seedMessage(inbox.id, org.id, { isRead: false })
+
+    // A second member of the same organization, not the inbox's creator —
+    // isStarred's owner-only mutation would 404 this caller.
+    const colleague = await prisma.user.create({
+      data: {
+        email: `colleague-${message.id}@test.dev`,
+        passwordHash: await hashPassword('password123'),
+        emailVerified: true,
+      },
+    })
+    await prisma.membership.create({
+      data: { userId: colleague.id, organizationId: org.id, role: 'member' as never },
+    })
+    const colleagueToken = signToken({ userId: colleague.id })
+
+    const res = await patchMessage(
+      jsonRequest(`http://localhost/api/app/emailInbox/${inbox.id}/messages/${message.id}`, {
+        method: 'PATCH', credential: colleagueToken,
+        body: { isRead: true },
+      }),
+      params({ id: inbox.id, messageId: message.id }),
+    )
+    expect(res.status).toBe(200)
+
+    const row = await prisma.emailMessage.findUniqueOrThrow({ where: { id: message.id } })
+    expect(row.isRead).toBe(true)
+  })
+
+  it('400 when isRead is not a boolean', async () => {
+    const { org, user, token } = await createOrgWithUser()
+    const inbox = await seedInbox(org.id, user.id)
+    const message = await seedMessage(inbox.id, org.id)
+
+    const res = await patchMessage(
+      jsonRequest(`http://localhost/api/app/emailInbox/${inbox.id}/messages/${message.id}`, {
+        method: 'PATCH', credential: token,
+        body: { isRead: 'yes' },
+      }),
+      params({ id: inbox.id, messageId: message.id }),
+    )
+    expect(res.status).toBe(400)
+  })
+
+  it('404 patching a message under another org\'s inbox', async () => {
+    const { org: orgA, user: userA } = await createOrgWithUser()
+    const inboxA = await seedInbox(orgA.id, userA.id)
+    const messageA = await seedMessage(inboxA.id, orgA.id, { isRead: false })
+
+    const { token: tokenB } = await createSecondOrg()
+
+    const res = await patchMessage(
+      jsonRequest(`http://localhost/api/app/emailInbox/${inboxA.id}/messages/${messageA.id}`, {
+        method: 'PATCH', credential: tokenB,
+        body: { isRead: true },
+      }),
+      params({ id: inboxA.id, messageId: messageA.id }),
+    )
+    expect(res.status).toBe(404)
+
+    const row = await prisma.emailMessage.findUniqueOrThrow({ where: { id: messageA.id } })
+    expect(row.isRead).toBe(false)
+  })
+})
+
 describe('DELETE /api/app/emailInbox/[id]/messages/[messageId]', () => {
   it('401 without a token', async () => {
     const res = await deleteMessage(
@@ -354,43 +444,120 @@ describe('DELETE /api/app/emailInbox/[id]/messages/[messageId]', () => {
   })
 })
 
-describe('GET /api/app/emailInbox/[id]/otp', () => {
-  it('401 without a token', async () => {
+describe('GET /api/v1/emailInbox/[id]/otp', () => {
+  it('401 without a key', async () => {
     const res = await getOtp(
-      jsonRequest('http://localhost/api/app/emailInbox/some-id/otp'),
+      jsonRequest('http://localhost/api/v1/emailInbox/some-id/otp'),
       params({ id: 'some-id' }),
     )
     expect(res.status).toBe(401)
   })
 
-  it('returns the latest extractedOtp for the inbox', async () => {
-    const { org, user, token } = await createOrgWithUser()
+  it('403s a key lacking email_messages:read', async () => {
+    const { org, user } = await createOrgWithUser()
+    const key = await createApiKey(org.id, user.id, ['email_inboxes:read'])
     const inbox = await seedInbox(org.id, user.id)
-    await seedMessage(inbox.id, org.id, { extractedOtp: '111111', createdAt: at(1) })
-    const latest = await seedMessage(inbox.id, org.id, { extractedOtp: '222222', createdAt: at(2) })
 
     const res = await getOtp(
-      jsonRequest(`http://localhost/api/app/emailInbox/${inbox.id}/otp`, { credential: token }),
+      jsonRequest(`http://localhost/api/v1/emailInbox/${inbox.id}/otp`, { credential: key.rawKey }),
+      params({ id: inbox.id }),
+    )
+    expect(res.status).toBe(403)
+  })
+
+  it('returns the latest extractedOtp for the inbox', async () => {
+    // Real, Date.now()-relative timestamps rather than the fixed at() helper:
+    // findLatestOtp applies a real freshness window (default 15 minutes)
+    // against the actual clock, and this suite does not fake timers.
+    const { org, user } = await createOrgWithUser()
+    const key = await createApiKey(org.id, user.id, ['email_messages:read'])
+    const inbox = await seedInbox(org.id, user.id)
+    await seedMessage(inbox.id, org.id, {
+      extractedOtp: '111111',
+      createdAt: new Date(Date.now() - 2 * 60_000),
+    })
+    const latest = await seedMessage(inbox.id, org.id, {
+      extractedOtp: '222222',
+      createdAt: new Date(Date.now() - 60_000),
+      from: 'security@example.com',
+    })
+
+    const res = await getOtp(
+      jsonRequest(`http://localhost/api/v1/emailInbox/${inbox.id}/otp`, { credential: key.rawKey }),
       params({ id: inbox.id }),
     )
     expect(res.status).toBe(200)
     const { data } = await res.json()
     expect(data.otp).toBe('222222')
-    expect(data.messageId).toBe(latest.id)
+    expect(data.message.from).toBe('security@example.com')
+    expect(data.message.id).toBe(latest.id)
   })
 
   it('404 when no message has an extractedOtp', async () => {
-    const { org, user, token } = await createOrgWithUser()
+    const { org, user } = await createOrgWithUser()
+    const key = await createApiKey(org.id, user.id, ['email_messages:read'])
     const inbox = await seedInbox(org.id, user.id)
     await seedMessage(inbox.id, org.id, { extractedOtp: null })
 
     const res = await getOtp(
-      jsonRequest(`http://localhost/api/app/emailInbox/${inbox.id}/otp`, { credential: token }),
+      jsonRequest(`http://localhost/api/v1/emailInbox/${inbox.id}/otp`, { credential: key.rawKey }),
       params({ id: inbox.id }),
     )
     expect(res.status).toBe(404)
     const { message } = await res.json()
-    expect(message).toBe('No OTP found for this inbox')
+    expect(message).toContain('No message with a one-time code has arrived')
+  })
+
+  it('404s a stale code distinctly from finding none, and respects withinMinutes', async () => {
+    const { org, user } = await createOrgWithUser()
+    const key = await createApiKey(org.id, user.id, ['email_messages:read'])
+    const inbox = await seedInbox(org.id, user.id)
+    const staleAt = new Date(Date.now() - 60 * 60_000)
+    await seedMessage(inbox.id, org.id, { extractedOtp: '444444', createdAt: staleAt })
+
+    const stale = await getOtp(
+      jsonRequest(`http://localhost/api/v1/emailInbox/${inbox.id}/otp`, { credential: key.rawKey }),
+      params({ id: inbox.id }),
+    )
+    expect(stale.status).toBe(404)
+    expect((await stale.json()).message).toContain('older than 15 minutes')
+
+    const widened = await getOtp(
+      jsonRequest(`http://localhost/api/v1/emailInbox/${inbox.id}/otp?withinMinutes=120`, {
+        credential: key.rawKey,
+      }),
+      params({ id: inbox.id }),
+    )
+    expect(widened.status).toBe(200)
+    expect((await widened.json()).data.otp).toBe('444444')
+  })
+
+  it('filters by from', async () => {
+    // Real, Date.now()-relative timestamps — see the note in the previous test.
+    const { org, user } = await createOrgWithUser()
+    const key = await createApiKey(org.id, user.id, ['email_messages:read'])
+    const inbox = await seedInbox(org.id, user.id)
+    await seedMessage(inbox.id, org.id, {
+      extractedOtp: '555555',
+      from: 'noreply@other.com',
+      createdAt: new Date(Date.now() - 2 * 60_000),
+    })
+    const target = await seedMessage(inbox.id, org.id, {
+      extractedOtp: '666666',
+      from: 'noreply@stripe.com',
+      createdAt: new Date(Date.now() - 60_000),
+    })
+
+    const res = await getOtp(
+      jsonRequest(`http://localhost/api/v1/emailInbox/${inbox.id}/otp?from=stripe.com`, {
+        credential: key.rawKey,
+      }),
+      params({ id: inbox.id }),
+    )
+    expect(res.status).toBe(200)
+    const { data } = await res.json()
+    expect(data.otp).toBe('666666')
+    expect(data.message.id).toBe(target.id)
   })
 
   it('404 for another org\'s inbox', async () => {
@@ -398,10 +565,11 @@ describe('GET /api/app/emailInbox/[id]/otp', () => {
     const inbox = await seedInbox(org.id, user.id)
     await seedMessage(inbox.id, org.id, { extractedOtp: '333333' })
 
-    const { token: otherToken } = await createSecondOrg()
+    const { org: otherOrg, user: otherUser } = await createSecondOrg()
+    const otherKey = await createApiKey(otherOrg.id, otherUser.id, ['email_messages:read'])
 
     const res = await getOtp(
-      jsonRequest(`http://localhost/api/app/emailInbox/${inbox.id}/otp`, { credential: otherToken }),
+      jsonRequest(`http://localhost/api/v1/emailInbox/${inbox.id}/otp`, { credential: otherKey.rawKey }),
       params({ id: inbox.id }),
     )
     expect(res.status).toBe(404)
